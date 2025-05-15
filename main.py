@@ -4,8 +4,8 @@ import uvicorn
 import tempfile
 import os
 
-from screenplay_pdf_to_json.parse_pdf import parsePdf, groupDualDialogues, groupSections, sortLines, cleanPage, getTopTrends, stitchSeperateWordsIntoLines, processInitialPages
-from screenplay_pdf_to_json.utils import cleanScript
+from parse_pdf import parsePdf, groupDualDialogues, groupSections, sortLines, cleanPage, getTopTrends, stitchSeperateWordsIntoLines, processInitialPages
+from utils import cleanScript
 
 app = FastAPI(title="Screenplay PDF to JSON Converter API",
               description="API to convert screenplay PDFs into structured JSON format")
