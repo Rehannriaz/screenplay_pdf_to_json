@@ -1,18 +1,21 @@
-FROM python:3.10-slim
+FROM python:3.10-alpine3.20
+
+# Install system dependencies
+RUN apk add --no-cache \
+    build-base \
+    python3-dev \
+    libffi-dev \
+    musl-dev \
+    gcc \
+    py3-pip \
+    cargo
 
 WORKDIR /app
-
-# Copy only requirements first for better caching
 COPY requirements.txt .
 
-# Install dependencies
+# Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy all source files
 COPY . .
 
-# Expose the port the app runs on
-EXPOSE 8000
-
-# Run the application
-CMD ["python", "convert.py"]
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
