@@ -1,5 +1,5 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, UploadFile, File, HTTPException, Form
+from fastapi.responses import JSONResponse, Response
 import uvicorn
 import tempfile
 import os
@@ -7,12 +7,8 @@ import os
 from parse_pdf import parsePdf, groupDualDialogues, groupSections, sortLines, cleanPage, getTopTrends, stitchSeperateWordsIntoLines, processInitialPages
 from utils import cleanScript
 
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form
-from fastapi.responses import Response
 from pydantic import BaseModel
 from typing import List, Optional
-import tempfile
-import os
 import subprocess
 import base64
 import json
@@ -20,9 +16,33 @@ import asyncio
 from pathlib import Path
 import shutil
 
-app = FastAPI(title="Screenplay PDF to JSON Converter API",
-              description="API to convert screenplay PDFs into structured JSON format")
+# Single FastAPI app instance
+app = FastAPI(
+    title="Screenplay PDF to JSON & Audio Mixing Service",
+    description="API to convert screenplay PDFs into structured JSON format and mix audio with sound effects"
+)
 
+# Root route for Railway health check
+@app.get("/")
+async def root():
+    """Root endpoint for health checks"""
+    return {"message": "Screenplay PDF & Audio Mixing Service is running", "status": "healthy"}
+
+@app.get("/health")
+async def health_check():
+    """Detailed health check endpoint"""
+    ffmpeg_available = check_ffmpeg_available()
+    return {
+        "status": "healthy",
+        "ffmpeg_available": ffmpeg_available,
+        "message": "All services are running",
+        "services": {
+            "pdf_conversion": True,
+            "audio_mixing": ffmpeg_available
+        }
+    }
+
+# PDF Conversion Endpoints
 @app.post("/convert/", response_class=JSONResponse)
 async def convert_pdf_to_json(
     pdf_file: UploadFile = File(...),
@@ -109,15 +129,7 @@ def convert(script_file, page_start):
     
     return new_script
 
-if __name__ == "__main__":
-    # Run the FastAPI application
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
-    
-    
-    
-
-app = FastAPI(title="Audio Mixing Service")
-
+# Audio Mixing Models and Functions
 class SoundEffect(BaseModel):
     audio_base64: str
     start_time: float
@@ -271,16 +283,7 @@ async def mix_audio_with_ffmpeg(
         except Exception as e:
             print(f"Warning: Failed to remove temp directory {temp_dir}: {e}")
 
-@app.get("/health")
-async def health_check():
-    """Health check endpoint"""
-    ffmpeg_available = check_ffmpeg_available()
-    return {
-        "status": "healthy",
-        "ffmpeg_available": ffmpeg_available,
-        "message": "Audio mixing service is running"
-    }
-
+# Audio Mixing Endpoints
 @app.post("/mix-audio", response_model=AudioMixResponse)
 async def mix_audio_endpoint(request: AudioMixRequest):
     """
@@ -471,3 +474,9 @@ async def debug_ffmpeg():
             "ffmpeg_available": False,
             "error": str(e)
         }
+
+# Fixed startup for Railway deployment
+if __name__ == "__main__":
+    # Use PORT environment variable from Railway, fallback to 8000
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)
