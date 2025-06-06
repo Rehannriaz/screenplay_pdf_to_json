@@ -1,6 +1,6 @@
 FROM python:3.10-alpine3.20
 
-# Install system dependencies
+# Install system dependencies including FFmpeg
 RUN apk add --no-cache \
     build-base \
     python3-dev \
@@ -8,16 +8,17 @@ RUN apk add --no-cache \
     musl-dev \
     gcc \
     py3-pip \
-    cargo
+    cargo \
+    ffmpeg
 
 WORKDIR /app
-COPY requirements.txt .
 
-# Install Python dependencies
+COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
+
+# Make sure to expose the port that Railway will use
 EXPOSE 8000
 
-
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["python", "main.py"]
