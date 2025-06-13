@@ -16,6 +16,16 @@ import asyncio
 from pathlib import Path
 import shutil
 
+from pydantic import BaseModel
+from typing import List, Optional
+import subprocess
+import base64
+import json
+import asyncio
+import tempfile
+import os
+import shutil
+
 # Single FastAPI app instance
 app = FastAPI(
     title="Screenplay PDF to JSON & Audio Mixing Service",
@@ -130,11 +140,15 @@ def convert(script_file, page_start):
     return new_script
 
 # Audio Mixing Models and Functions
+
 class SoundEffect(BaseModel):
     audio_base64: str
     start_time: float
     volume: Optional[float] = 0.3
     description: str
+    fade_in_duration: Optional[float] = 1.5  # Fade in duration in seconds
+    fade_out_duration: Optional[float] = 1.5  # Fade out duration in seconds
+    duration: Optional[float] = None  # Optional: specify sound effect duration
 
 class AudioMixRequest(BaseModel):
     speech_audio_base64: str
@@ -174,7 +188,7 @@ async def mix_audio_with_ffmpeg(
     sound_effects: List[dict], 
     total_duration: float
 ) -> bytes:
-    """Mix speech audio with sound effects using FFmpeg"""
+    """Mix speech audio with sound effects using FFmpeg with fade in/out effects"""
     
     if not sound_effects:
         return speech_audio
@@ -204,10 +218,13 @@ async def mix_audio_with_ffmpeg(
             sfx_paths.append({
                 "path": sfx_path,
                 "start_time": sfx["start_time"],
-                "volume": sfx["volume"]
+                "volume": sfx["volume"],
+                "fade_in_duration": sfx.get("fade_in_duration", 0.5),
+                "fade_out_duration": sfx.get("fade_out_duration", 0.5),
+                "duration": sfx.get("duration")
             })
         
-        # Build FFmpeg filter complex
+        # Build FFmpeg filter complex with fade effects
         filter_parts = []
         mix_inputs = ["[0:a]"]  # Main speech audio
         
@@ -216,9 +233,36 @@ async def mix_audio_with_ffmpeg(
             delay_ms = int(sfx["start_time"] * 1000)
             output_label = f"sfx{i}"
             
-            filter_parts.append(
-                f"[{input_index}:a]adelay={delay_ms}|{delay_ms},volume={sfx['volume']}[{output_label}]"
-            )
+            # Build the filter chain for this sound effect
+            filter_chain = f"[{input_index}:a]"
+            
+            # Add delay
+            filter_chain += f"adelay={delay_ms}|{delay_ms}"
+            
+            # Add volume adjustment
+            filter_chain += f",volume={sfx['volume']}"
+            
+            # Add fade in effect
+            fade_in_duration = sfx["fade_in_duration"]
+            if fade_in_duration > 0:
+                filter_chain += f",afade=t=in:st={sfx['start_time']:.3f}:d={fade_in_duration:.3f}"
+            
+            # Add fade out effect
+            fade_out_duration = sfx["fade_out_duration"]
+            if fade_out_duration > 0:
+                # Calculate fade out start time
+                if sfx["duration"]:
+                    # If duration is specified, fade out before the end
+                    fade_out_start = sfx["start_time"] + sfx["duration"] - fade_out_duration
+                else:
+                    # If no duration specified, fade out near the end of total duration
+                    fade_out_start = total_duration - fade_out_duration
+                
+                if fade_out_start > sfx["start_time"]:  # Only add fade out if it makes sense
+                    filter_chain += f",afade=t=out:st={fade_out_start:.3f}:d={fade_out_duration:.3f}"
+            
+            # Complete the filter for this sound effect
+            filter_parts.append(f"{filter_chain}[{output_label}]")
             mix_inputs.append(f"[{output_label}]")
         
         # Final mix command
@@ -283,14 +327,14 @@ async def mix_audio_with_ffmpeg(
         except Exception as e:
             print(f"Warning: Failed to remove temp directory {temp_dir}: {e}")
 
-# Audio Mixing Endpoints
+# Updated audio mixing endpoint
 @app.post("/mix-audio", response_model=AudioMixResponse)
 async def mix_audio_endpoint(request: AudioMixRequest):
     """
-    Mix speech audio with sound effects
+    Mix speech audio with sound effects with fade in/out capabilities
     
     This endpoint takes base64-encoded speech audio and sound effects,
-    mixes them using FFmpeg, and returns the mixed audio as base64.
+    mixes them using FFmpeg with fade effects, and returns the mixed audio as base64.
     """
     try:
         # Check if FFmpeg is available
@@ -323,7 +367,7 @@ async def mix_audio_endpoint(request: AudioMixRequest):
         except Exception as e:
             raise HTTPException(status_code=400, detail=f"Invalid speech audio base64: {e}")
         
-        # Prepare sound effects
+        # Prepare sound effects with fade parameters
         sound_effects = []
         for i, sfx in enumerate(request.sound_effects):
             try:
@@ -332,7 +376,10 @@ async def mix_audio_endpoint(request: AudioMixRequest):
                     "audio": sfx_audio,
                     "start_time": sfx.start_time,
                     "volume": sfx.volume or 0.3,
-                    "description": sfx.description
+                    "description": sfx.description,
+                    "fade_in_duration": sfx.fade_in_duration or 0.5,
+                    "fade_out_duration": sfx.fade_out_duration or 0.5,
+                    "duration": sfx.duration
                 })
             except Exception as e:
                 raise HTTPException(
@@ -353,12 +400,13 @@ async def mix_audio_endpoint(request: AudioMixRequest):
         return AudioMixResponse(
             mixed_audio_base64=mixed_audio_base64,
             success=True,
-            message="Audio mixing completed successfully",
+            message="Audio mixing with fade effects completed successfully",
             processing_info={
                 "sound_effects_count": len(sound_effects),
                 "total_duration": request.total_duration,
                 "mixing_performed": True,
-                "output_size_bytes": len(mixed_audio)
+                "output_size_bytes": len(mixed_audio),
+                "fade_effects_applied": True
             }
         )
         
@@ -369,6 +417,82 @@ async def mix_audio_endpoint(request: AudioMixRequest):
             status_code=500, 
             detail=f"Audio mixing failed: {str(e)}"
         )
+
+# Updated simple endpoint with fade support
+@app.post("/mix-audio-simple")
+async def mix_audio_simple_endpoint(
+    speech_audio: UploadFile = File(...),
+    sound_effects_data: str = Form(...),
+    total_duration: float = Form(...)
+):
+    """
+    Alternative endpoint that accepts file uploads directly with fade support
+    sound_effects_data should be JSON string with sound effect metadata including fade parameters
+    
+    Example sound_effects_data JSON:
+    [
+        {
+            "audio_base64": "base64_encoded_audio_data",
+            "start_time": 5.0,
+            "volume": 0.4,
+            "fade_in_duration": 1.0,
+            "fade_out_duration": 2.0,
+            "duration": 10.0,
+            "description": "Background music"
+        }
+    ]
+    """
+    try:
+        # Check FFmpeg availability
+        if not check_ffmpeg_available():
+            raise HTTPException(
+                status_code=500, 
+                detail="FFmpeg is not available on this system"
+            )
+        
+        # Read speech audio
+        speech_content = await speech_audio.read()
+        
+        # Parse sound effects metadata
+        try:
+            sfx_metadata = json.loads(sound_effects_data)
+        except json.JSONDecodeError:
+            raise HTTPException(status_code=400, detail="Invalid sound_effects_data JSON")
+        
+        # Process sound effects with fade parameters
+        sound_effects = []
+        for sfx in sfx_metadata:
+            if "audio_base64" not in sfx:
+                continue
+            try:
+                sfx_audio = base64.b64decode(sfx["audio_base64"])
+                sound_effects.append({
+                    "audio": sfx_audio,
+                    "start_time": sfx.get("start_time", 0),
+                    "volume": sfx.get("volume", 0.3),
+                    "description": sfx.get("description", ""),
+                    "fade_in_duration": sfx.get("fade_in_duration", 0.5),
+                    "fade_out_duration": sfx.get("fade_out_duration", 0.5),
+                    "duration": sfx.get("duration")
+                })
+            except Exception:
+                continue  # Skip invalid sound effects
+        
+        # Perform mixing
+        mixed_audio = await mix_audio_with_ffmpeg(speech_content, sound_effects, total_duration)
+        
+        # Return as audio file response
+        return Response(
+            content=mixed_audio,
+            media_type="audio/mpeg",
+            headers={"Content-Disposition": "attachment; filename=mixed_audio_with_fades.mp3"}
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Audio mixing failed: {str(e)}")
+# Audio Mixing Endpoints
 
 @app.post("/mix-audio-simple")
 async def mix_audio_simple_endpoint(
