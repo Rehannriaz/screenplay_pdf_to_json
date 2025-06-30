@@ -338,42 +338,81 @@ async def mix_audio_with_ffmpeg(
         filter_parts = []
         mix_inputs = ["[0:a]"]  # Main speech audio
         
-        for i, sfx in enumerate(sfx_paths):
-            input_index = i + 1  # +1 because 0 is speech
+        # Special handling for single sound effect - loop it for the entire duration
+        if len(sfx_paths) == 1:
+            sfx = sfx_paths[0]
+            input_index = 1
             delay_ms = int(sfx["start_time"] * 1000)
-            output_label = f"sfx{i}"
+            output_label = "sfx0"
             
-            # Build the filter chain for this sound effect
+            # Build the filter chain for looping sound effect
             filter_chain = f"[{input_index}:a]"
             
+            # Loop the audio for the total duration minus start time
+            loop_duration = total_duration - sfx["start_time"]
+            filter_chain += f"aloop=loop=-1:size=2e+09,atrim=end={loop_duration:.3f}"
+            
             # Add delay
-            filter_chain += f"adelay={delay_ms}|{delay_ms}"
+            if delay_ms > 0:
+                filter_chain += f",adelay={delay_ms}|{delay_ms}"
             
             # Add volume adjustment
             filter_chain += f",volume={sfx['volume']}"
             
-            # Add fade in effect
+            # Add fade in effect at the start
             fade_in_duration = sfx["fade_in_duration"]
             if fade_in_duration > 0:
                 filter_chain += f",afade=t=in:st={sfx['start_time']:.3f}:d={fade_in_duration:.3f}"
             
-            # Add fade out effect
+            # Add fade out effect at the end
             fade_out_duration = sfx["fade_out_duration"]
             if fade_out_duration > 0:
-                # Calculate fade out start time
-                if sfx["duration"]:
-                    # If duration is specified, fade out before the end
-                    fade_out_start = sfx["start_time"] + sfx["duration"] - fade_out_duration
-                else:
-                    # If no duration specified, fade out near the end of total duration
-                    fade_out_start = total_duration - fade_out_duration
-                
-                if fade_out_start > sfx["start_time"]:  # Only add fade out if it makes sense
+                fade_out_start = total_duration - fade_out_duration
+                if fade_out_start > sfx["start_time"]:
                     filter_chain += f",afade=t=out:st={fade_out_start:.3f}:d={fade_out_duration:.3f}"
             
-            # Complete the filter for this sound effect
+            # Complete the filter for the looped sound effect
             filter_parts.append(f"{filter_chain}[{output_label}]")
             mix_inputs.append(f"[{output_label}]")
+        
+        else:
+            # Original logic for multiple sound effects
+            for i, sfx in enumerate(sfx_paths):
+                input_index = i + 1  # +1 because 0 is speech
+                delay_ms = int(sfx["start_time"] * 1000)
+                output_label = f"sfx{i}"
+                
+                # Build the filter chain for this sound effect
+                filter_chain = f"[{input_index}:a]"
+                
+                # Add delay
+                filter_chain += f"adelay={delay_ms}|{delay_ms}"
+                
+                # Add volume adjustment
+                filter_chain += f",volume={sfx['volume']}"
+                
+                # Add fade in effect
+                fade_in_duration = sfx["fade_in_duration"]
+                if fade_in_duration > 0:
+                    filter_chain += f",afade=t=in:st={sfx['start_time']:.3f}:d={fade_in_duration:.3f}"
+                
+                # Add fade out effect
+                fade_out_duration = sfx["fade_out_duration"]
+                if fade_out_duration > 0:
+                    # Calculate fade out start time
+                    if sfx["duration"]:
+                        # If duration is specified, fade out before the end
+                        fade_out_start = sfx["start_time"] + sfx["duration"] - fade_out_duration
+                    else:
+                        # If no duration specified, fade out near the end of total duration
+                        fade_out_start = total_duration - fade_out_duration
+                    
+                    if fade_out_start > sfx["start_time"]:  # Only add fade out if it makes sense
+                        filter_chain += f",afade=t=out:st={fade_out_start:.3f}:d={fade_out_duration:.3f}"
+                
+                # Complete the filter for this sound effect
+                filter_parts.append(f"{filter_chain}[{output_label}]")
+                mix_inputs.append(f"[{output_label}]")
         
         # Final mix command with optional normalization
         if normalize_volume:
@@ -443,7 +482,6 @@ async def mix_audio_with_ffmpeg(
             shutil.rmtree(temp_dir)
         except Exception as e:
             print(f"Warning: Failed to remove temp directory {temp_dir}: {e}")
-
 async def normalize_single_audio(
     audio_data: bytes,
     target_lufs: float = -16.0,
