@@ -16,16 +16,6 @@ import asyncio
 from pathlib import Path
 import shutil
 
-from pydantic import BaseModel
-from typing import List, Optional
-import subprocess
-import base64
-import json
-import asyncio
-import tempfile
-import os
-import shutil
-
 # Single FastAPI app instance
 app = FastAPI(
     title="Screenplay PDF to JSON & Audio Mixing Service",
@@ -146,14 +136,17 @@ class SoundEffect(BaseModel):
     start_time: float
     volume: Optional[float] = 0.3
     description: str
-    fade_in_duration: Optional[float] = 1.5  # Fade in duration in seconds
-    fade_out_duration: Optional[float] = 1.5  # Fade out duration in seconds
+    fade_in_duration: Optional[float] = 0.3  # Fade in duration in seconds
+    fade_out_duration: Optional[float] = 0.3  # Fade out duration in seconds
     duration: Optional[float] = None  # Optional: specify sound effect duration
 
 class AudioMixRequest(BaseModel):
     speech_audio_base64: str
     sound_effects: List[SoundEffect]
     total_duration: float
+    normalize_volume: Optional[bool] = True  # Enable volume normalization by default
+    target_lufs: Optional[float] = -16.0  # Target loudness in LUFS (EBU R128 standard)
+    peak_limit: Optional[float] = -1.0  # Peak limiter in dB
 
 class AudioMixResponse(BaseModel):
     mixed_audio_base64: str
@@ -183,14 +176,131 @@ def safe_cleanup(temp_files: List[str]) -> None:
         except Exception as e:
             print(f"Warning: Failed to cleanup {file_path}: {e}")
 
+async def normalize_audio_levels(
+    input_path: str, 
+    output_path: str, 
+    target_lufs: float = -16.0,
+    peak_limit: float = -1.0
+) -> bool:
+    """
+    Normalize audio levels using FFmpeg loudnorm filter
+    
+    Args:
+        input_path: Path to input audio file
+        output_path: Path to output normalized audio file
+        target_lufs: Target loudness in LUFS (default: -16.0 for streaming)
+        peak_limit: Peak limiter in dB (default: -1.0)
+    
+    Returns:
+        bool: True if normalization successful, False otherwise
+    """
+    try:
+        # First pass: analyze audio to get loudness statistics
+        analyze_cmd = [
+            "ffmpeg",
+            "-i", input_path,
+            "-af", f"loudnorm=I={target_lufs}:TP={peak_limit}:LRA=11:print_format=json",
+            "-f", "null",
+            "-"
+        ]
+        
+        process = await asyncio.create_subprocess_exec(
+            *analyze_cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        
+        stdout, stderr = await process.communicate()
+        
+        if process.returncode != 0:
+            print(f"Audio analysis failed: {stderr.decode()}")
+            return False
+        
+        # Extract loudness measurements from stderr (FFmpeg outputs to stderr)
+        stderr_text = stderr.decode()
+        
+        # Look for the JSON output in stderr
+        json_start = stderr_text.find('{')
+        json_end = stderr_text.rfind('}') + 1
+        
+        if json_start != -1 and json_end > json_start:
+            try:
+                loudness_data = json.loads(stderr_text[json_start:json_end])
+                
+                # Second pass: apply normalization with measured values
+                normalize_cmd = [
+                    "ffmpeg",
+                    "-y",  # Overwrite output
+                    "-i", input_path,
+                    "-af", (
+                        f"loudnorm=I={target_lufs}:TP={peak_limit}:LRA=11:"
+                        f"measured_I={loudness_data.get('input_i', target_lufs)}:"
+                        f"measured_LRA={loudness_data.get('input_lra', 11)}:"
+                        f"measured_TP={loudness_data.get('input_tp', peak_limit)}:"
+                        f"measured_thresh={loudness_data.get('input_thresh', -26)}:"
+                        f"offset={loudness_data.get('target_offset', 0)}"
+                    ),
+                    "-c:a", "mp3",
+                    "-b:a", "128k",
+                    output_path
+                ]
+                
+            except json.JSONDecodeError:
+                # Fallback to single-pass normalization
+                normalize_cmd = [
+                    "ffmpeg",
+                    "-y",
+                    "-i", input_path,
+                    "-af", f"loudnorm=I={target_lufs}:TP={peak_limit}:LRA=11",
+                    "-c:a", "mp3",
+                    "-b:a", "128k",
+                    output_path
+                ]
+        else:
+            # Fallback to single-pass normalization
+            normalize_cmd = [
+                "ffmpeg",
+                "-y",
+                "-i", input_path,
+                "-af", f"loudnorm=I={target_lufs}:TP={peak_limit}:LRA=11",
+                "-c:a", "mp3",
+                "-b:a", "128k",
+                output_path
+            ]
+        
+        # Execute normalization
+        process = await asyncio.create_subprocess_exec(
+            *normalize_cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        
+        stdout, stderr = await process.communicate()
+        
+        if process.returncode != 0:
+            print(f"Audio normalization failed: {stderr.decode()}")
+            return False
+        
+        return os.path.exists(output_path)
+        
+    except Exception as e:
+        print(f"Error during audio normalization: {e}")
+        return False
+
 async def mix_audio_with_ffmpeg(
     speech_audio: bytes, 
     sound_effects: List[dict], 
-    total_duration: float
+    total_duration: float,
+    normalize_volume: bool = True,
+    target_lufs: float = -16.0,
+    peak_limit: float = -1.0
 ) -> bytes:
-    """Mix speech audio with sound effects using FFmpeg with fade in/out effects"""
+    """Mix speech audio with sound effects using FFmpeg with fade in/out effects and volume normalization"""
     
     if not sound_effects:
+        if normalize_volume:
+            # Even if no sound effects, normalize the speech audio
+            return await normalize_single_audio(speech_audio, target_lufs, peak_limit)
         return speech_audio
     
     # Create temporary directory for this session
@@ -265,10 +375,17 @@ async def mix_audio_with_ffmpeg(
             filter_parts.append(f"{filter_chain}[{output_label}]")
             mix_inputs.append(f"[{output_label}]")
         
-        # Final mix command
-        filter_parts.append(
-            f"{''.join(mix_inputs)}amix=inputs={len(mix_inputs)}:duration=longest"
-        )
+        # Final mix command with optional normalization
+        if normalize_volume:
+            # Add loudness normalization to the filter chain
+            filter_parts.append(
+                f"{''.join(mix_inputs)}amix=inputs={len(mix_inputs)}:duration=longest,"
+                f"loudnorm=I={target_lufs}:TP={peak_limit}:LRA=11"
+            )
+        else:
+            filter_parts.append(
+                f"{''.join(mix_inputs)}amix=inputs={len(mix_inputs)}:duration=longest"
+            )
         
         filter_complex = "; ".join(filter_parts)
         
@@ -327,14 +444,53 @@ async def mix_audio_with_ffmpeg(
         except Exception as e:
             print(f"Warning: Failed to remove temp directory {temp_dir}: {e}")
 
+async def normalize_single_audio(
+    audio_data: bytes,
+    target_lufs: float = -16.0,
+    peak_limit: float = -1.0
+) -> bytes:
+    """Normalize a single audio file"""
+    temp_dir = tempfile.mkdtemp(prefix="audio_norm_")
+    temp_files = []
+    
+    try:
+        # Write input audio
+        input_path = os.path.join(temp_dir, "input.mp3")
+        with open(input_path, "wb") as f:
+            f.write(audio_data)
+        temp_files.append(input_path)
+        
+        # Output path
+        output_path = os.path.join(temp_dir, "output.mp3")
+        temp_files.append(output_path)
+        
+        # Normalize
+        success = await normalize_audio_levels(input_path, output_path, target_lufs, peak_limit)
+        
+        if not success:
+            # Return original if normalization failed
+            return audio_data
+        
+        # Read normalized audio
+        with open(output_path, "rb") as f:
+            return f.read()
+            
+    finally:
+        safe_cleanup(temp_files)
+        try:
+            shutil.rmtree(temp_dir)
+        except Exception:
+            pass
+
 # Updated audio mixing endpoint
 @app.post("/mix-audio", response_model=AudioMixResponse)
 async def mix_audio_endpoint(request: AudioMixRequest):
     """
-    Mix speech audio with sound effects with fade in/out capabilities
+    Mix speech audio with sound effects with fade in/out capabilities and volume normalization
     
     This endpoint takes base64-encoded speech audio and sound effects,
-    mixes them using FFmpeg with fade effects, and returns the mixed audio as base64.
+    mixes them using FFmpeg with fade effects and volume normalization, 
+    and returns the mixed audio as base64.
     """
     try:
         # Check if FFmpeg is available
@@ -349,17 +505,55 @@ async def mix_audio_endpoint(request: AudioMixRequest):
             raise HTTPException(status_code=400, detail="Speech audio is required")
         
         if not request.sound_effects:
-            # No sound effects, just return the original audio
-            return AudioMixResponse(
-                mixed_audio_base64=request.speech_audio_base64,
-                success=True,
-                message="No sound effects to mix, returned original audio",
-                processing_info={
-                    "sound_effects_count": 0,
-                    "total_duration": request.total_duration,
-                    "mixing_performed": False
-                }
-            )
+            # No sound effects, just normalize the original audio if requested
+            if request.normalize_volume:
+                try:
+                    speech_audio = base64.b64decode(request.speech_audio_base64)
+                    normalized_audio = await normalize_single_audio(
+                        speech_audio, 
+                        request.target_lufs or -16.0,
+                        request.peak_limit or -1.0
+                    )
+                    normalized_base64 = base64.b64encode(normalized_audio).decode()
+                    
+                    return AudioMixResponse(
+                        mixed_audio_base64=normalized_base64,
+                        success=True,
+                        message="No sound effects to mix, returned normalized speech audio",
+                        processing_info={
+                            "sound_effects_count": 0,
+                            "total_duration": request.total_duration,
+                            "mixing_performed": False,
+                            "normalization_performed": True,
+                            "target_lufs": request.target_lufs or -16.0
+                        }
+                    )
+                except Exception as e:
+                    # If normalization fails, return original
+                    return AudioMixResponse(
+                        mixed_audio_base64=request.speech_audio_base64,
+                        success=True,
+                        message=f"No sound effects to mix, normalization failed: {e}",
+                        processing_info={
+                            "sound_effects_count": 0,
+                            "total_duration": request.total_duration,
+                            "mixing_performed": False,
+                            "normalization_performed": False,
+                            "normalization_error": str(e)
+                        }
+                    )
+            else:
+                return AudioMixResponse(
+                    mixed_audio_base64=request.speech_audio_base64,
+                    success=True,
+                    message="No sound effects to mix, returned original audio",
+                    processing_info={
+                        "sound_effects_count": 0,
+                        "total_duration": request.total_duration,
+                        "mixing_performed": False,
+                        "normalization_performed": False
+                    }
+                )
         
         # Decode speech audio
         try:
@@ -387,11 +581,14 @@ async def mix_audio_endpoint(request: AudioMixRequest):
                     detail=f"Invalid sound effect {i} base64: {e}"
                 )
         
-        # Perform audio mixing
+        # Perform audio mixing with normalization
         mixed_audio = await mix_audio_with_ffmpeg(
             speech_audio, 
             sound_effects, 
-            request.total_duration
+            request.total_duration,
+            request.normalize_volume or True,
+            request.target_lufs or -16.0,
+            request.peak_limit or -1.0
         )
         
         # Encode result to base64
@@ -400,11 +597,14 @@ async def mix_audio_endpoint(request: AudioMixRequest):
         return AudioMixResponse(
             mixed_audio_base64=mixed_audio_base64,
             success=True,
-            message="Audio mixing with fade effects completed successfully",
+            message="Audio mixing with fade effects and volume normalization completed successfully",
             processing_info={
                 "sound_effects_count": len(sound_effects),
                 "total_duration": request.total_duration,
                 "mixing_performed": True,
+                "normalization_performed": request.normalize_volume or True,
+                "target_lufs": request.target_lufs or -16.0,
+                "peak_limit": request.peak_limit or -1.0,
                 "output_size_bytes": len(mixed_audio),
                 "fade_effects_applied": True
             }
@@ -418,29 +618,26 @@ async def mix_audio_endpoint(request: AudioMixRequest):
             detail=f"Audio mixing failed: {str(e)}"
         )
 
-# Updated simple endpoint with fade support
+# Updated simple endpoint with normalization support
 @app.post("/mix-audio-simple")
 async def mix_audio_simple_endpoint(
     speech_audio: UploadFile = File(...),
     sound_effects_data: str = Form(...),
-    total_duration: float = Form(...)
+    total_duration: float = Form(...),
+    normalize_volume: bool = Form(True),
+    target_lufs: float = Form(-16.0),
+    peak_limit: float = Form(-1.0)
 ):
     """
-    Alternative endpoint that accepts file uploads directly with fade support
-    sound_effects_data should be JSON string with sound effect metadata including fade parameters
+    Alternative endpoint that accepts file uploads directly with fade and normalization support
     
-    Example sound_effects_data JSON:
-    [
-        {
-            "audio_base64": "base64_encoded_audio_data",
-            "start_time": 5.0,
-            "volume": 0.4,
-            "fade_in_duration": 1.0,
-            "fade_out_duration": 2.0,
-            "duration": 10.0,
-            "description": "Background music"
-        }
-    ]
+    Args:
+        speech_audio: Main speech audio file
+        sound_effects_data: JSON string with sound effect metadata including fade parameters
+        total_duration: Total duration of the mixed audio
+        normalize_volume: Whether to apply volume normalization (default: True)
+        target_lufs: Target loudness in LUFS (default: -16.0)
+        peak_limit: Peak limiter in dB (default: -1.0)
     """
     try:
         # Check FFmpeg availability
@@ -478,73 +675,22 @@ async def mix_audio_simple_endpoint(
             except Exception:
                 continue  # Skip invalid sound effects
         
-        # Perform mixing
-        mixed_audio = await mix_audio_with_ffmpeg(speech_content, sound_effects, total_duration)
-        
-        # Return as audio file response
-        return Response(
-            content=mixed_audio,
-            media_type="audio/mpeg",
-            headers={"Content-Disposition": "attachment; filename=mixed_audio_with_fades.mp3"}
+        # Perform mixing with normalization
+        mixed_audio = await mix_audio_with_ffmpeg(
+            speech_content, 
+            sound_effects, 
+            total_duration,
+            normalize_volume,
+            target_lufs,
+            peak_limit
         )
         
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Audio mixing failed: {str(e)}")
-# Audio Mixing Endpoints
-
-@app.post("/mix-audio-simple")
-async def mix_audio_simple_endpoint(
-    speech_audio: UploadFile = File(...),
-    sound_effects_data: str = Form(...),
-    total_duration: float = Form(...)
-):
-    """
-    Alternative endpoint that accepts file uploads directly
-    sound_effects_data should be JSON string with sound effect metadata
-    """
-    try:
-        # Check FFmpeg availability
-        if not check_ffmpeg_available():
-            raise HTTPException(
-                status_code=500, 
-                detail="FFmpeg is not available on this system"
-            )
-        
-        # Read speech audio
-        speech_content = await speech_audio.read()
-        
-        # Parse sound effects metadata
-        try:
-            sfx_metadata = json.loads(sound_effects_data)
-        except json.JSONDecodeError:
-            raise HTTPException(status_code=400, detail="Invalid sound_effects_data JSON")
-        
-        # For this simple version, we assume sound effects are provided as base64 in metadata
-        sound_effects = []
-        for sfx in sfx_metadata:
-            if "audio_base64" not in sfx:
-                continue
-            try:
-                sfx_audio = base64.b64decode(sfx["audio_base64"])
-                sound_effects.append({
-                    "audio": sfx_audio,
-                    "start_time": sfx.get("start_time", 0),
-                    "volume": sfx.get("volume", 0.3),
-                    "description": sfx.get("description", "")
-                })
-            except Exception:
-                continue  # Skip invalid sound effects
-        
-        # Perform mixing
-        mixed_audio = await mix_audio_with_ffmpeg(speech_content, sound_effects, total_duration)
-        
         # Return as audio file response
+        filename = f"mixed_audio_normalized_{target_lufs}LUFS.mp3" if normalize_volume else "mixed_audio.mp3"
         return Response(
             content=mixed_audio,
             media_type="audio/mpeg",
-            headers={"Content-Disposition": "attachment; filename=mixed_audio.mp3"}
+            headers={"Content-Disposition": f"attachment; filename={filename}"}
         )
         
     except HTTPException:
@@ -576,10 +722,22 @@ async def debug_ffmpeg():
         
         has_mp3 = "mp3" in codecs_result.stdout.lower() if codecs_result.stdout else False
         
+        # Check for loudnorm filter
+        filters_result = subprocess.run(
+            ["ffmpeg", "-filters"], 
+            capture_output=True, 
+            text=True, 
+            timeout=10
+        )
+        
+        has_loudnorm = "loudnorm" in filters_result.stdout.lower() if filters_result.stdout else False
+        
         return {
             "ffmpeg_available": result.returncode == 0,
             "version": version_info,
             "mp3_codec_available": has_mp3,
+            "loudnorm_filter_available": has_loudnorm,
+            "normalization_supported": has_loudnorm,
             "return_code": result.returncode
         }
         
