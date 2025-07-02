@@ -129,30 +129,40 @@ def convert(script_file, page_start):
     
     return new_script
 
-# Audio Mixing Models and Functions
+# Audio Mixing Models
 
 class SoundEffect(BaseModel):
     audio_base64: str
     start_time: float
     volume: Optional[float] = 0.3
     description: str
-    fade_in_duration: Optional[float] = 0.3  # Fade in duration in seconds
-    fade_out_duration: Optional[float] = 0.3  # Fade out duration in seconds
-    duration: Optional[float] = None  # Optional: specify sound effect duration
+    fade_in_duration: Optional[float] = 0.3
+    fade_out_duration: Optional[float] = 0.3
+    duration: Optional[float] = None
+
+class NarratorTimestamp(BaseModel):
+    start_time: float
+    end_time: float
 
 class AudioMixRequest(BaseModel):
     speech_audio_base64: str
     sound_effects: List[SoundEffect]
     total_duration: float
-    normalize_volume: Optional[bool] = True  # Enable volume normalization by default
-    target_lufs: Optional[float] = -16.0  # Target loudness in LUFS (EBU R128 standard)
-    peak_limit: Optional[float] = -1.0  # Peak limiter in dB
+    normalize_volume: Optional[bool] = True
+    target_lufs: Optional[float] = -16.0
+    peak_limit: Optional[float] = -1.0
+    narrator_timestamps: Optional[List[NarratorTimestamp]] = []
+    background_music_base64: Optional[str] = None
+    narrator_bg_volume: Optional[float] = 0.4  # Volume when narrator is speaking
+    character_bg_volume: Optional[float] = 0.15  # Volume when characters are speaking
 
 class AudioMixResponse(BaseModel):
     mixed_audio_base64: str
     success: bool
     message: str
     processing_info: dict
+
+# Audio Mixing Utility Functions
 
 def check_ffmpeg_available() -> bool:
     """Check if FFmpeg is available in the system"""
@@ -287,201 +297,6 @@ async def normalize_audio_levels(
         print(f"Error during audio normalization: {e}")
         return False
 
-async def mix_audio_with_ffmpeg(
-    speech_audio: bytes, 
-    sound_effects: List[dict], 
-    total_duration: float,
-    normalize_volume: bool = True,
-    target_lufs: float = -16.0,
-    peak_limit: float = -1.0
-) -> bytes:
-    """Mix speech audio with sound effects using FFmpeg with fade in/out effects and volume normalization"""
-    
-    if not sound_effects:
-        if normalize_volume:
-            # Even if no sound effects, normalize the speech audio
-            return await normalize_single_audio(speech_audio, target_lufs, peak_limit)
-        return speech_audio
-    
-    # Create temporary directory for this session
-    temp_dir = tempfile.mkdtemp(prefix="audio_mix_")
-    temp_files = []
-    
-    try:
-        # Write speech audio to temp file
-        speech_path = os.path.join(temp_dir, "speech.mp3")
-        with open(speech_path, "wb") as f:
-            f.write(speech_audio)
-        temp_files.append(speech_path)
-        
-        # Write sound effects to temp files
-        sfx_paths = []
-        input_paths = [speech_path]
-        
-        for i, sfx in enumerate(sound_effects):
-            sfx_path = os.path.join(temp_dir, f"sfx_{i}.mp3")
-            with open(sfx_path, "wb") as f:
-                f.write(sfx["audio"])
-            temp_files.append(sfx_path)
-            input_paths.append(sfx_path)
-            
-            sfx_paths.append({
-                "path": sfx_path,
-                "start_time": sfx["start_time"],
-                "volume": sfx["volume"],
-                "fade_in_duration": sfx.get("fade_in_duration", 0.5),
-                "fade_out_duration": sfx.get("fade_out_duration", 0.5),
-                "duration": sfx.get("duration")
-            })
-        
-        # Build FFmpeg filter complex with fade effects
-        filter_parts = []
-        mix_inputs = ["[0:a]"]  # Main speech audio
-        
-        # Special handling for single sound effect - loop it for the entire duration
-        if len(sfx_paths) == 1:
-            sfx = sfx_paths[0]
-            input_index = 1
-            delay_ms = int(sfx["start_time"] * 1000)
-            output_label = "sfx0"
-            
-            # Build the filter chain for looping sound effect
-            filter_chain = f"[{input_index}:a]"
-            
-            # Loop the audio for the total duration minus start time
-            loop_duration = total_duration - sfx["start_time"]
-            filter_chain += f"aloop=loop=-1:size=2e+09,atrim=end={loop_duration:.3f}"
-            
-            # Add delay
-            if delay_ms > 0:
-                filter_chain += f",adelay={delay_ms}|{delay_ms}"
-            
-            # Add volume adjustment
-            filter_chain += f",volume={sfx['volume']}"
-            
-            # Add fade in effect at the start
-            fade_in_duration = sfx["fade_in_duration"]
-            if fade_in_duration > 0:
-                filter_chain += f",afade=t=in:st={sfx['start_time']:.3f}:d={fade_in_duration:.3f}"
-            
-            # Add fade out effect at the end
-            fade_out_duration = sfx["fade_out_duration"]
-            if fade_out_duration > 0:
-                fade_out_start = total_duration - fade_out_duration
-                if fade_out_start > sfx["start_time"]:
-                    filter_chain += f",afade=t=out:st={fade_out_start:.3f}:d={fade_out_duration:.3f}"
-            
-            # Complete the filter for the looped sound effect
-            filter_parts.append(f"{filter_chain}[{output_label}]")
-            mix_inputs.append(f"[{output_label}]")
-        
-        else:
-            # Original logic for multiple sound effects
-            for i, sfx in enumerate(sfx_paths):
-                input_index = i + 1  # +1 because 0 is speech
-                delay_ms = int(sfx["start_time"] * 1000)
-                output_label = f"sfx{i}"
-                
-                # Build the filter chain for this sound effect
-                filter_chain = f"[{input_index}:a]"
-                
-                # Add delay
-                filter_chain += f"adelay={delay_ms}|{delay_ms}"
-                
-                # Add volume adjustment
-                filter_chain += f",volume={sfx['volume']}"
-                
-                # Add fade in effect
-                fade_in_duration = sfx["fade_in_duration"]
-                if fade_in_duration > 0:
-                    filter_chain += f",afade=t=in:st={sfx['start_time']:.3f}:d={fade_in_duration:.3f}"
-                
-                # Add fade out effect
-                fade_out_duration = sfx["fade_out_duration"]
-                if fade_out_duration > 0:
-                    # Calculate fade out start time
-                    if sfx["duration"]:
-                        # If duration is specified, fade out before the end
-                        fade_out_start = sfx["start_time"] + sfx["duration"] - fade_out_duration
-                    else:
-                        # If no duration specified, fade out near the end of total duration
-                        fade_out_start = total_duration - fade_out_duration
-                    
-                    if fade_out_start > sfx["start_time"]:  # Only add fade out if it makes sense
-                        filter_chain += f",afade=t=out:st={fade_out_start:.3f}:d={fade_out_duration:.3f}"
-                
-                # Complete the filter for this sound effect
-                filter_parts.append(f"{filter_chain}[{output_label}]")
-                mix_inputs.append(f"[{output_label}]")
-        
-        # Final mix command with optional normalization
-        if normalize_volume:
-            # Add loudness normalization to the filter chain
-            filter_parts.append(
-                f"{''.join(mix_inputs)}amix=inputs={len(mix_inputs)}:duration=longest,"
-                f"loudnorm=I={target_lufs}:TP={peak_limit}:LRA=11"
-            )
-        else:
-            filter_parts.append(
-                f"{''.join(mix_inputs)}amix=inputs={len(mix_inputs)}:duration=longest"
-            )
-        
-        filter_complex = "; ".join(filter_parts)
-        
-        # Output file
-        output_path = os.path.join(temp_dir, "output.mp3")
-        temp_files.append(output_path)
-        
-        # Build FFmpeg command
-        cmd = [
-            "ffmpeg",
-            "-y",  # Overwrite output file
-        ]
-        
-        # Add input files
-        for input_path in input_paths:
-            cmd.extend(["-i", input_path])
-        
-        # Add filter complex and output options
-        cmd.extend([
-            "-filter_complex", filter_complex,
-            "-c:a", "mp3",
-            "-b:a", "128k",
-            "-t", str(total_duration),
-            output_path
-        ])
-        
-        # Execute FFmpeg command
-        process = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-        
-        stdout, stderr = await process.communicate()
-        
-        if process.returncode != 0:
-            error_msg = stderr.decode() if stderr else "Unknown FFmpeg error"
-            raise RuntimeError(f"FFmpeg failed: {error_msg}")
-        
-        # Check if output file was created
-        if not os.path.exists(output_path):
-            raise RuntimeError("Output file was not created")
-        
-        # Read the mixed audio
-        with open(output_path, "rb") as f:
-            mixed_audio = f.read()
-        
-        return mixed_audio
-        
-    finally:
-        # Clean up temp files
-        safe_cleanup(temp_files)
-        # Remove temp directory
-        try:
-            shutil.rmtree(temp_dir)
-        except Exception as e:
-            print(f"Warning: Failed to remove temp directory {temp_dir}: {e}")
 async def normalize_single_audio(
     audio_data: bytes,
     target_lufs: float = -16.0,
@@ -520,17 +335,212 @@ async def normalize_single_audio(
         except Exception:
             pass
 
-# Updated audio mixing endpoint
+async def mix_audio_with_ffmpeg(
+    speech_audio: bytes, 
+    sound_effects: List[dict], 
+    total_duration: float,
+    normalize_volume: bool = True,
+    target_lufs: float = -16.0,
+    peak_limit: float = -1.0,
+    narrator_timestamps: List[dict] = None,
+    background_music: bytes = None,
+    narrator_bg_volume: float = 0.1,
+    character_bg_volume: float = 0.05
+) -> bytes:
+    """
+    Mix speech audio with sound effects and background music with dynamic volume based on narrator timestamps
+    
+    Args:
+        speech_audio: Main speech audio as bytes
+        sound_effects: List of sound effect dictionaries
+        total_duration: Total duration of the mixed audio
+        normalize_volume: Whether to normalize the final output
+        target_lufs: Target loudness for normalization
+        peak_limit: Peak limiter for normalization
+        narrator_timestamps: List of timestamp dictionaries for narrator sections
+        background_music: Background music as bytes (optional)
+        narrator_bg_volume: Background music volume when narrator is speaking
+        character_bg_volume: Background music volume when characters are speaking
+    
+    Returns:
+        Mixed audio as bytes
+    """
+    temp_dir = tempfile.mkdtemp(prefix="audio_mix_")
+    temp_files = []
+    
+    try:
+        # Write speech audio to temp file
+        speech_path = os.path.join(temp_dir, "speech.mp3")
+        with open(speech_path, "wb") as f:
+            f.write(speech_audio)
+        temp_files.append(speech_path)
+        
+        input_paths = [speech_path]
+        filter_parts = []
+        mix_inputs = ["[0:a]"]  # Main speech audio
+        
+        # Handle background music if provided
+        if background_music:
+            bg_music_path = os.path.join(temp_dir, "bg_music.mp3")
+            with open(bg_music_path, "wb") as f:
+                f.write(background_music)
+            temp_files.append(bg_music_path)
+            input_paths.append(bg_music_path)
+            
+            bg_input_index = len(input_paths) - 1
+            
+            # Create dynamic volume filter for background music based on narrator timestamps
+            volume_filter = f"[{bg_input_index}:a]aloop=loop=-1:size=2e+09,atrim=end={total_duration:.3f}"
+            
+            if narrator_timestamps:
+                # Start with character volume (lower) as default
+                volume_filter += f",volume={character_bg_volume}"
+                
+                # Sort narrator timestamps by start time
+                sorted_timestamps = sorted(narrator_timestamps, key=lambda x: x["start_time"])
+                
+                # Add volume increases for narrator sections
+                for timestamp in sorted_timestamps:
+                    start_time = timestamp["start_time"]
+                    end_time = timestamp["end_time"]
+                    # Increase the volume during narrator speech
+                    volume_filter += f",volume='if(between(t,{start_time},{end_time}),{narrator_bg_volume}/{character_bg_volume},1)':eval=frame"
+                
+            else:
+                # No narrator timestamps, use constant narrator volume with looping
+                volume_filter = f"[{bg_input_index}:a]aloop=loop=-1:size=2e+09,atrim=end={total_duration:.3f},volume={narrator_bg_volume}"
+            
+            filter_parts.append(f"{volume_filter}[bgmusic]")
+            mix_inputs.append("[bgmusic]")
+            
+            print(f"Background music filter: {volume_filter}")
+        
+        # Handle sound effects
+        for i, sfx in enumerate(sound_effects):
+            sfx_path = os.path.join(temp_dir, f"sfx_{i}.mp3")
+            with open(sfx_path, "wb") as f:
+                f.write(sfx["audio"])
+            temp_files.append(sfx_path)
+            input_paths.append(sfx_path)
+            
+            input_index = len(input_paths) - 1
+            delay_ms = int(sfx["start_time"] * 1000)
+            output_label = f"sfx{i}"
+            
+            # Build the filter chain for this sound effect
+            filter_chain = f"[{input_index}:a]"
+            
+            # Add delay
+            filter_chain += f"adelay={delay_ms}|{delay_ms}"
+            
+            # Add volume adjustment
+            filter_chain += f",volume={sfx['volume']}"
+            
+            # Add fade effects if specified
+            fade_in_duration = sfx.get("fade_in_duration", 0.3)
+            if fade_in_duration > 0:
+                filter_chain += f",afade=t=in:st={sfx['start_time']:.3f}:d={fade_in_duration:.3f}"
+            
+            fade_out_duration = sfx.get("fade_out_duration", 0.3)
+            if fade_out_duration > 0:
+                if sfx.get("duration"):
+                    fade_out_start = sfx["start_time"] + sfx["duration"] - fade_out_duration
+                else:
+                    fade_out_start = total_duration - fade_out_duration
+                
+                if fade_out_start > sfx["start_time"]:
+                    filter_chain += f",afade=t=out:st={fade_out_start:.3f}:d={fade_out_duration:.3f}"
+            
+            filter_parts.append(f"{filter_chain}[{output_label}]")
+            mix_inputs.append(f"[{output_label}]")
+        
+        # Final mix command with optional normalization
+        if normalize_volume:
+            filter_parts.append(
+                f"{''.join(mix_inputs)}amix=inputs={len(mix_inputs)}:duration=longest,"
+                f"loudnorm=I={target_lufs}:TP={peak_limit}:LRA=11"
+            )
+        else:
+            filter_parts.append(
+                f"{''.join(mix_inputs)}amix=inputs={len(mix_inputs)}:duration=longest"
+            )
+        
+        filter_complex = "; ".join(filter_parts)
+        
+        # Output file
+        output_path = os.path.join(temp_dir, "output.mp3")
+        temp_files.append(output_path)
+        
+        # Build FFmpeg command
+        cmd = [
+            "ffmpeg",
+            "-y",  # Overwrite output file
+        ]
+        
+        # Add input files
+        for input_path in input_paths:
+            cmd.extend(["-i", input_path])
+        
+        # Add filter complex and output options
+        cmd.extend([
+            "-filter_complex", filter_complex,
+            "-c:a", "mp3",
+            "-b:a", "128k",
+            "-t", str(total_duration),
+            output_path
+        ])
+        
+        print(f"FFmpeg command: {' '.join(cmd)}")
+        print(f"Filter complex: {filter_complex}")
+        
+        # Execute FFmpeg command
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        
+        stdout, stderr = await process.communicate()
+        
+        if process.returncode != 0:
+            error_msg = stderr.decode() if stderr else "Unknown FFmpeg error"
+            print(f"FFmpeg stderr: {error_msg}")
+            raise RuntimeError(f"FFmpeg failed: {error_msg}")
+        
+        # Check if output file was created
+        if not os.path.exists(output_path):
+            raise RuntimeError("Output file was not created")
+        
+        # Read the mixed audio
+        with open(output_path, "rb") as f:
+            mixed_audio = f.read()
+        
+        return mixed_audio
+        
+    finally:
+        # Clean up temp files
+        safe_cleanup(temp_files)
+        try:
+            shutil.rmtree(temp_dir)
+        except Exception as e:
+            print(f"Warning: Failed to remove temp directory {temp_dir}: {e}")
+
+# Audio Mixing Endpoints
+
 @app.post("/mix-audio", response_model=AudioMixResponse)
 async def mix_audio_endpoint(request: AudioMixRequest):
     """
-    Mix speech audio with sound effects with fade in/out capabilities and volume normalization
+    Mix speech audio with sound effects and background music with narrator-based volume control
     
-    This endpoint takes base64-encoded speech audio and sound effects,
-    mixes them using FFmpeg with fade effects and volume normalization, 
-    and returns the mixed audio as base64.
+    This endpoint supports:
+    - Dynamic background music volume based on narrator timestamps
+    - Sound effects with fade in/out capabilities
+    - Volume normalization
+    - Base64 encoded audio input/output
     """
     try:
+        print("Narrator timestamps:", request.narrator_timestamps)
+        
         # Check if FFmpeg is available
         if not check_ffmpeg_available():
             raise HTTPException(
@@ -542,8 +552,9 @@ async def mix_audio_endpoint(request: AudioMixRequest):
         if not request.speech_audio_base64:
             raise HTTPException(status_code=400, detail="Speech audio is required")
         
-        if not request.sound_effects:
-            # No sound effects, just normalize the original audio if requested
+        # Handle case with no sound effects but possible background music
+        if not request.sound_effects and not request.background_music_base64:
+            # No sound effects or background music, just normalize if requested
             if request.normalize_volume:
                 try:
                     speech_audio = base64.b64decode(request.speech_audio_base64)
@@ -557,17 +568,18 @@ async def mix_audio_endpoint(request: AudioMixRequest):
                     return AudioMixResponse(
                         mixed_audio_base64=normalized_base64,
                         success=True,
-                        message="No sound effects to mix, returned normalized speech audio",
+                        message="No sound effects or background music to mix, returned normalized speech audio",
                         processing_info={
                             "sound_effects_count": 0,
                             "total_duration": request.total_duration,
                             "mixing_performed": False,
                             "normalization_performed": True,
+                            "background_music_added": False,
+                            "narrator_timestamps_count": 0,
                             "target_lufs": request.target_lufs or -16.0
                         }
                     )
                 except Exception as e:
-                    # If normalization fails, return original
                     return AudioMixResponse(
                         mixed_audio_base64=request.speech_audio_base64,
                         success=True,
@@ -577,6 +589,8 @@ async def mix_audio_endpoint(request: AudioMixRequest):
                             "total_duration": request.total_duration,
                             "mixing_performed": False,
                             "normalization_performed": False,
+                            "background_music_added": False,
+                            "narrator_timestamps_count": 0,
                             "normalization_error": str(e)
                         }
                     )
@@ -584,12 +598,14 @@ async def mix_audio_endpoint(request: AudioMixRequest):
                 return AudioMixResponse(
                     mixed_audio_base64=request.speech_audio_base64,
                     success=True,
-                    message="No sound effects to mix, returned original audio",
+                    message="No sound effects or background music to mix, returned original audio",
                     processing_info={
                         "sound_effects_count": 0,
                         "total_duration": request.total_duration,
                         "mixing_performed": False,
-                        "normalization_performed": False
+                        "normalization_performed": False,
+                        "background_music_added": False,
+                        "narrator_timestamps_count": 0
                     }
                 )
         
@@ -599,7 +615,15 @@ async def mix_audio_endpoint(request: AudioMixRequest):
         except Exception as e:
             raise HTTPException(status_code=400, detail=f"Invalid speech audio base64: {e}")
         
-        # Prepare sound effects with fade parameters
+        # Decode background music if provided
+        background_music = None
+        if request.background_music_base64:
+            try:
+                background_music = base64.b64decode(request.background_music_base64)
+            except Exception as e:
+                raise HTTPException(status_code=400, detail=f"Invalid background music base64: {e}")
+        
+        # Prepare sound effects
         sound_effects = []
         for i, sfx in enumerate(request.sound_effects):
             try:
@@ -609,8 +633,8 @@ async def mix_audio_endpoint(request: AudioMixRequest):
                     "start_time": sfx.start_time,
                     "volume": sfx.volume or 0.3,
                     "description": sfx.description,
-                    "fade_in_duration": sfx.fade_in_duration or 0.5,
-                    "fade_out_duration": sfx.fade_out_duration or 0.5,
+                    "fade_in_duration": sfx.fade_in_duration or 0.3,
+                    "fade_out_duration": sfx.fade_out_duration or 0.3,
                     "duration": sfx.duration
                 })
             except Exception as e:
@@ -619,14 +643,29 @@ async def mix_audio_endpoint(request: AudioMixRequest):
                     detail=f"Invalid sound effect {i} base64: {e}"
                 )
         
-        # Perform audio mixing with normalization
+        # Convert narrator timestamps to dict format
+        narrator_timestamps_dict = []
+        if request.narrator_timestamps:
+            narrator_timestamps_dict = [
+                {
+                    "start_time": ts.start_time,
+                    "end_time": ts.end_time
+                }
+                for ts in request.narrator_timestamps
+            ]
+        
+        # Perform audio mixing
         mixed_audio = await mix_audio_with_ffmpeg(
             speech_audio, 
             sound_effects, 
             request.total_duration,
             request.normalize_volume or True,
             request.target_lufs or -16.0,
-            request.peak_limit or -1.0
+            request.peak_limit or -1.0,
+            narrator_timestamps_dict,
+            background_music,
+            request.narrator_bg_volume or 0.4,
+            request.character_bg_volume or 0.15
         )
         
         # Encode result to base64
@@ -635,16 +674,17 @@ async def mix_audio_endpoint(request: AudioMixRequest):
         return AudioMixResponse(
             mixed_audio_base64=mixed_audio_base64,
             success=True,
-            message="Audio mixing with fade effects and volume normalization completed successfully",
+            message="Audio mixing with background music and narrator-based volume control completed successfully",
             processing_info={
                 "sound_effects_count": len(sound_effects),
                 "total_duration": request.total_duration,
                 "mixing_performed": True,
                 "normalization_performed": request.normalize_volume or True,
+                "background_music_added": background_music is not None,
+                "narrator_timestamps_count": len(narrator_timestamps_dict),
                 "target_lufs": request.target_lufs or -16.0,
                 "peak_limit": request.peak_limit or -1.0,
-                "output_size_bytes": len(mixed_audio),
-                "fade_effects_applied": True
+                "output_size_bytes": len(mixed_audio)
             }
         )
         
@@ -656,7 +696,6 @@ async def mix_audio_endpoint(request: AudioMixRequest):
             detail=f"Audio mixing failed: {str(e)}"
         )
 
-# Updated simple endpoint with normalization support
 @app.post("/mix-audio-simple")
 async def mix_audio_simple_endpoint(
     speech_audio: UploadFile = File(...),
@@ -706,8 +745,8 @@ async def mix_audio_simple_endpoint(
                     "start_time": sfx.get("start_time", 0),
                     "volume": sfx.get("volume", 0.3),
                     "description": sfx.get("description", ""),
-                    "fade_in_duration": sfx.get("fade_in_duration", 0.5),
-                    "fade_out_duration": sfx.get("fade_out_duration", 0.5),
+                    "fade_in_duration": sfx.get("fade_in_duration", 0.3),
+                    "fade_out_duration": sfx.get("fade_out_duration", 0.3),
                     "duration": sfx.get("duration")
                 })
             except Exception:
